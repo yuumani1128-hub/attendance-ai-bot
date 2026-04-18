@@ -76,6 +76,48 @@ CATEGORY_KEYWORDS = (
     ),
 )
 
+# 人に回す（担当者へ渡す）ときに、そのカテゴリで揃えてほしい情報のテンプレ。
+# キーは classify_category() が返すカテゴリ名と一致させます。
+HANDOFF_TEMPLATES: dict[str, str] = {
+    CATEGORY_DESCRIPTION_MISTAKE: (
+        "【担当者へ回すときのメモ】\n"
+        "・対象日時\n"
+        "・記載ミスの詳細\n"
+    ),
+    CATEGORY_CLOCK_MISS: (
+        "【担当者へ回すときのメモ】\n"
+        "・対象日時\n"
+        "・漏れた打刻（出勤/退勤/休憩など）\n"
+        "・本来の時刻（分かる範囲で）\n"
+    ),
+    CATEGORY_LATE: (
+        "【担当者へ回すときのメモ】\n"
+        "・対象日時\n"
+        "・遅刻の理由・到着予定（分かる範囲で）\n"
+    ),
+    CATEGORY_TRAIN_DELAY: (
+        "【担当者へ回すときのメモ】\n"
+        "・対象日時\n"
+        "・路線名・遅延証明の有無\n"
+    ),
+    CATEGORY_HALF_DAY_OFF: (
+        "【担当者へ回すときのメモ】\n"
+        "・対象日\n"
+        "・午前休 / 午後休 のどちらか\n"
+        "・取得理由（任意）\n"
+    ),
+    CATEGORY_HOLIDAY_WORK: (
+        "【担当者へ回すときのメモ】\n"
+        "・対象日時\n"
+        "・休日出勤の内容（任意）\n"
+    ),
+    # どのキーワードにも当てはまらなかったときのカテゴリ「その他」用
+    OTHER: (
+        "【担当者へ回すときのメモ】\n"
+        "・問い合わせ内容\n"
+    ),
+}
+
 
 def classify(text: str) -> str:
     """問い合わせ文を1カテゴリに分類する。"""
@@ -111,6 +153,11 @@ def classify_category(text: str) -> str:
     return OTHER
 
 
+def handoff_template_for_category(category: str) -> str:
+    """カテゴリに対応する人への引き継ぎテンプレを返す。未定義なら「その他」用を使う。"""
+    return HANDOFF_TEMPLATES.get(category, HANDOFF_TEMPLATES[OTHER])
+
+
 def main() -> None:
     print("勤怠問い合わせボット（終了: 空行または quit）")
     while True:
@@ -124,6 +171,11 @@ def main() -> None:
 
         print(f"種別: {inquiry_type}")
         print(f"カテゴリ: {inquiry_category}")
+
+        # ルール確認はFAQ等で完結させる想定のため、人への回し文は出さない。
+        # 勤怠ミス報告・その他のときだけ、カテゴリに応じたテンプレを表示する。
+        if inquiry_type in (MISTAKE_REPORT, OTHER):
+            print(handoff_template_for_category(inquiry_category))
 
 
 if __name__ == "__main__":
