@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 # 分類ラベル
 RULE_CHECK = "ルール確認"
 MISTAKE_REPORT = "勤怠ミス報告"
@@ -44,8 +46,11 @@ RULE_KEYWORDS = (
     "できますか",
     "いいですか",
     "大丈夫",
-    "教えて",  
+    "教えて",
 )
+
+# rules.txt はこのスクリプトと同じフォルダに置く（[カテゴリ名] 形式のルール本文）
+RULES_PATH = Path(__file__).resolve().parent / "rules.txt"
 
 # カテゴリ判定用のキーワード。
 # 似た内容が重なる場合があるため、判定順（下の関数内）で優先度を調整します。
@@ -158,8 +163,79 @@ def handoff_template_for_category(category: str) -> str:
     return HANDOFF_TEMPLATES.get(category, HANDOFF_TEMPLATES[OTHER])
 
 
+def load_rules() -> dict[str, str]:
+    """
+    rules.txt を読み込み、[セクション名] と次の [ までの本文を辞書にまとめる。
+
+    例:
+        [遅刻]
+        遅刻する場合は...
+
+    → {"遅刻": "遅刻する場合は..."}
+    """
+    if not RULES_PATH.is_file():
+        return {}
+
+    try:
+        raw = RULES_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+
+    # セクション名 → 本文（外部APIなしの「擬似AI」で参照するデータ）
+    sections: dict[str, str] = {}
+    current_title: str | None = None
+    body_lines: list[str] = []
+
+    for line in raw.splitlines():
+        s = line.strip()
+        # [遅刻] のような行を見つけたら、直前のセクションを確定して次へ
+        if s.startswith("[") and s.endswith("]") and len(s) >= 2:
+            if current_title is not None:
+                sections[current_title] = "\n".join(body_lines).strip()
+            current_title = s[1:-1].strip()
+            body_lines = []
+            continue
+
+        if current_title is not None:
+            body_lines.append(line)
+
+    if current_title is not None:
+        sections[current_title] = "\n".join(body_lines).strip()
+
+    return sections
+
+
+def get_rule_answer(category: str, rules: dict[str, str]) -> str | None:
+    """
+    カテゴリ名に一致するセクション本文を返す。
+    rules.txt に [カテゴリ名] が無い、または本文が空なら None。
+    """
+    text = rules.get(category)
+    if text is None:
+        return None
+    text = text.strip()
+    return text if text else None
+
+
+def generate_answer(user_input: str, category: str, rules: dict[str, str]) -> str:
+    """
+    ルール確認向けの回答文を組み立てる（現状は辞書照合のみ）。
+
+    user_input は今は使わないが、将来 LLM API に差し替えるときの質問文として渡せるようにしておく。
+    """
+    _ = user_input  # 将来の LLM 連携用（現状の擬似AIでは未使用）
+
+    found = get_rule_answer(category, rules)
+    if found is None:
+        return "該当するルールが見つかりません。管理者に確認してください。"
+    return found
+
+
 def main() -> None:
     print("勤怠問い合わせボット（終了: 空行または quit）")
+    # rules.txt は起動時に一度読み込む（ファイルを書き換えたらアプリを再起動）
+    rules_data = load_rules()
+
     while True:
         line = input("> ").strip()
         if not line or line.lower() in ("quit", "exit", "q"):
@@ -172,10 +248,20 @@ def main() -> None:
         print(f"種別: {inquiry_type}")
         print(f"カテゴリ: {inquiry_category}")
 
-        # ルール確認はFAQ等で完結させる想定のため、人への回し文は出さない。
-        # 勤怠ミス報告・その他のときだけ、カテゴリに応じたテンプレを表示する。
-        if inquiry_type in (MISTAKE_REPORT, OTHER):
-            print(handoff_template_for_category(inquiry_category))
+        # ルール確認のみ rules.txt を参照して回答（外部APIなしの擬似AI）
+        if inquiry_type == RULE_CHECK:
+            answer = generate_answer(line, inquiry_category, rules_data)
+            print(f"回答: {answer}")
+        # 勤怠ミス報告・その他は、案内文のあと従来どおりテンプレを表示する。
+        elif inquiry_type in (MISTAKE_REPORT, OTHER):
+            print("管理者に確認してください。")
+            print("確認前に以下を整理してください:")
+            template_body = handoff_template_for_category(inquiry_category)
+            # 出力イメージに合わせ、見出し行だけ取り除いて箇条書き部分をそのまま出す
+            header = "【担当者へ回すときのメモ】\n"
+            if template_body.startswith(header):
+                template_body = template_body[len(header) :]
+            print(template_body)
 
 
 if __name__ == "__main__":
