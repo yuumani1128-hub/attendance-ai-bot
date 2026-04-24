@@ -1,1 +1,2 @@
-# このボットは標準ライブラリのみで動作します（擬似AI回答は rules.txt 照合）。
+# 擬似AI版ボット + Streamlit UI の依存関係
+streamlit>=1.30.0

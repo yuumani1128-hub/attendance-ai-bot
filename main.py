@@ -231,6 +231,39 @@ def generate_answer(user_input: str, category: str, rules: dict[str, str]) -> st
     return found
 
 
+def process_inquiry(user_input: str, rules: dict[str, str] | None = None) -> dict[str, str]:
+    """
+    1件の問い合わせを処理して、画面表示に必要な結果をまとめて返す。
+
+    Streamlit UI と CLI の両方から同じ処理を呼べるようにしておくと、
+    判定ロジックの修正が1か所で済みます。
+    """
+    rule_data = load_rules() if rules is None else rules
+
+    inquiry_type = classify(user_input)
+    inquiry_category = classify_category(user_input)
+
+    result: dict[str, str] = {
+        "type": inquiry_type,
+        "category": inquiry_category,
+    }
+
+    if inquiry_type == RULE_CHECK:
+        result["message"] = f"回答: {generate_answer(user_input, inquiry_category, rule_data)}"
+    else:
+        template_body = handoff_template_for_category(inquiry_category)
+        header = "【担当者へ回すときのメモ】\n"
+        if template_body.startswith(header):
+            template_body = template_body[len(header) :]
+        result["message"] = (
+            "管理者に確認してください。\n"
+            "確認前に以下を整理してください:\n"
+            f"{template_body}"
+        )
+
+    return result
+
+
 def main() -> None:
     print("勤怠問い合わせボット（終了: 空行または quit）")
     # rules.txt は起動時に一度読み込む（ファイルを書き換えたらアプリを再起動）
@@ -240,28 +273,11 @@ def main() -> None:
         line = input("> ").strip()
         if not line or line.lower() in ("quit", "exit", "q"):
             break
-        # 既存の大分類（種別）
-        inquiry_type = classify(line)
-        # 追加した詳細分類（カテゴリ）
-        inquiry_category = classify_category(line)
+        result = process_inquiry(line, rules_data)
 
-        print(f"種別: {inquiry_type}")
-        print(f"カテゴリ: {inquiry_category}")
-
-        # ルール確認のみ rules.txt を参照して回答（外部APIなしの擬似AI）
-        if inquiry_type == RULE_CHECK:
-            answer = generate_answer(line, inquiry_category, rules_data)
-            print(f"回答: {answer}")
-        # 勤怠ミス報告・その他は、案内文のあと従来どおりテンプレを表示する。
-        elif inquiry_type in (MISTAKE_REPORT, OTHER):
-            print("管理者に確認してください。")
-            print("確認前に以下を整理してください:")
-            template_body = handoff_template_for_category(inquiry_category)
-            # 出力イメージに合わせ、見出し行だけ取り除いて箇条書き部分をそのまま出す
-            header = "【担当者へ回すときのメモ】\n"
-            if template_body.startswith(header):
-                template_body = template_body[len(header) :]
-            print(template_body)
+        print(f"種別: {result['type']}")
+        print(f"カテゴリ: {result['category']}")
+        print(result["message"])
 
 
 if __name__ == "__main__":
