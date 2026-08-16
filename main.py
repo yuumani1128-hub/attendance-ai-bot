@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from llm import dev_log_llm, generate_llm_response
+
 # 分類ラベル
 RULE_CHECK = "ルール確認"
 MISTAKE_REPORT = "勤怠ミス報告"
@@ -38,6 +40,8 @@ RULE_KEYWORDS = (
     "休暇",
     "有給",
     "遅刻",
+    "電車遅延",
+    "遅延",
     "早退",
     "勤務時間",
     "残業",
@@ -218,17 +222,12 @@ def get_rule_answer(category: str, rules: dict[str, str]) -> str | None:
 
 
 def generate_answer(user_input: str, category: str, rules: dict[str, str]) -> str:
-    """
-    ルール確認向けの回答文を組み立てる（現状は辞書照合のみ）。
-
-    user_input は今は使わないが、将来 LLM API に差し替えるときの質問文として渡せるようにしておく。
-    """
-    _ = user_input  # 将来の LLM 連携用（現状の擬似AIでは未使用）
-
-    found = get_rule_answer(category, rules)
-    if found is None:
+    """ルール確認向けの回答文を LLM で生成する（関連ルールのみ API に送信）。"""
+    rule_context = get_rule_answer(category, rules)
+    if rule_context is None:
+        dev_log_llm(called=False, reason="ルール未該当")
         return "該当するルールが見つかりません。管理者に確認してください。"
-    return found
+    return generate_llm_response(user_input, rule_context)
 
 
 def process_inquiry(user_input: str, rules: dict[str, str] | None = None) -> dict[str, str]:
@@ -251,6 +250,7 @@ def process_inquiry(user_input: str, rules: dict[str, str] | None = None) -> dic
     if inquiry_type == RULE_CHECK:
         result["message"] = f"回答: {generate_answer(user_input, inquiry_category, rule_data)}"
     else:
+        dev_log_llm(called=False, reason=f"種別={inquiry_type}")
         template_body = handoff_template_for_category(inquiry_category)
         header = "【担当者へ回すときのメモ】\n"
         if template_body.startswith(header):
