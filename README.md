@@ -38,26 +38,36 @@
 
 ## 3. システム構成
 
-ユーザー
- │
-  ▼ Streamlit UI
- │
-  ▼ 問い合わせ判定
- │
-  ┌────┴────┐ │ │ ルール確認 管理者対応 │ │ ▼ ▼ rules.txt テンプレート表示
 
+```text
+ユーザー
+  │
+  ▼
+Streamlit UI
+  │
+  ▼
+問い合わせ判定
+  │
+  ├── ルール確認
+  │     └── rules.txt
+  │
+  └── 管理者対応
+        └── テンプレート表示
+```
 ---
 
 ## 4. ディレクトリ構成
-attendance-ai-bot
- │
- ├── app.py
- ├── main.py
- ├── rules.txt 
- ├── images 
- │   └── chat-ui.png 
- ├── README.md 
- └── requirements.txt
+
+```text
+attendance-ai-bot/
+├── app.py
+├── main.py
+├── rules.txt
+├── images/
+│   └── chat-ui.png
+├── README.md
+└── requirements.txt
+```
 
 ## 5. 使用技術
 
