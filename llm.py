@@ -26,15 +26,13 @@ ANSWER_SYSTEM_PROMPT = (
     "あなたは社内勤怠ルールについて回答するアシスタントです。"
     "【ルール】に記載された情報のみを根拠に、簡潔で自然な口語の日本語で回答してください。"
     "根拠のない内容を推測して断定しないでください。"
+    "申請方法・手続きの質問には、ルールの時刻・届出・備考欄・申請方法などの記載を手順として説明してください。"
     "ルールに記載が無い場合は「ルール上確認できないため、管理者へ確認してください」と案内してください。"
     "個別判断や管理者権限が必要な内容は、管理者確認を案内してください。"
     "【会話履歴】がある場合は文脈を踏まえてください。"
     "情報が不足している場合は、追加で1回だけ必要な質問をしてください。"
     "存在しない制度や手続きは作らないでください。"
 )
-
-# 後方互換のエイリアス
-SYSTEM_PROMPT = ANSWER_SYSTEM_PROMPT
 
 IntentType = Literal[
     "rule_check",
@@ -73,8 +71,9 @@ INTENT_SYSTEM_PROMPT = (
     "会話履歴と最新のユーザー発言を読み、intent を1つ選ぶ。"
     "rule_check=ルール・制度・手続きの確認。"
     "attendance_correction=打刻漏れ・記載ミス・打刻修正。"
-    "leave=有給・休暇・午前休・午後休。"
-    "needs_individual_handling=管理者判断が必要（承認、個別可否、実績確定など）。"
+    "leave=有給・休暇・午前休・午後休（休日出勤は rule_check）。"
+    "needs_individual_handling=管理者判断が必要（承認、個別可否、実績確定、"
+    "特定日時の打刻修正可否など）。"
     "insufficient_info=意図は推測できるが回答に必要な情報が不足。"
     "other=上記に当てはまらない。"
     "needs_clarification は、1回の追加質問で足りる情報が欠けている場合 true。"
@@ -144,7 +143,6 @@ def intent_analysis_to_dict(analysis: IntentAnalysis) -> dict[str, str | bool]:
 def analyze_intent(conversation_text: str) -> IntentAnalysis | None:
     """
     会話文脈からユーザーの意図を Structured Output で解釈する。
-    この段階では最終回答には使わず、デバッグ・後続 Step 用。
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:

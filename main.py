@@ -1,4 +1,4 @@
-"""勤怠問い合わせボット（最小構成）: 入力を3カテゴリに分類する。"""
+"""勤怠問い合わせボット: 会話履歴と LLM 意図理解に基づき問い合わせを処理する。"""
 
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ CATEGORY_KEYWORDS = (
     ),
     (
         CATEGORY_HOLIDAY_WORK,
-        ("休日出勤", "休日勤務", "土日出勤", "祝日出勤"),
+        ("休日出勤", "休日勤務", "土日出勤", "祝日出勤", "休出"),
     ),
     (
         CATEGORY_LATE,
@@ -127,7 +127,7 @@ RULE_SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "取得希望",
     ),
     CATEGORY_HALF_DAY_OFF: ("午前休", "午後休", "半休", "午前だけ", "午後だけ"),
-    CATEGORY_HOLIDAY_WORK: ("休日出勤", "休日勤務", "土日出勤", "祝日出勤", "休出"),
+    CATEGORY_HOLIDAY_WORK: ("休日出勤", "休日勤務", "土日出勤", "祝日出勤", "休出", "申請"),
 }
 
 # 意図理解結果から検索候補セクションを絞り込む（None=全セクション、()=ルール検索しない）
@@ -137,7 +137,7 @@ INTENT_SECTION_CANDIDATES: dict[str, tuple[str, ...] | None] = {
     "leave": (CATEGORY_PAID_LEAVE, CATEGORY_HALF_DAY_OFF),
     "needs_individual_handling": (),
     "insufficient_info": None,
-    "other": (),
+    "other": None,
 }
 
 # 勤怠ドメイン語（rule_check 時に勤怠関連か判定する）
@@ -166,6 +166,20 @@ ATTENDANCE_DOMAIN_KEYWORDS: tuple[str, ...] = (
     "修正",
     "忘れ",
     "漏れ",
+    "今日",
+    "明日",
+    "明後日",
+    "来週",
+)
+
+LEAVE_KEYWORDS: tuple[str, ...] = (
+    "有給",
+    "有休",
+    "年休",
+    "休暇",
+    "午前休",
+    "午後休",
+    "半休",
 )
 
 # 勤怠外と判断する語
@@ -184,6 +198,49 @@ NON_ATTENDANCE_KEYWORDS: tuple[str, ...] = (
 OUT_OF_SCOPE_MESSAGE = (
     "勤怠に関するご質問に回答できます。"
     "ランチや社内施設など、勤怠ルール以外の内容にはお答えできません。"
+)
+
+INDIVIDUAL_HANDOFF_INTRO = (
+    "このケースは個別確認が必要です。管理者へ確認してください。"
+)
+
+LEAVE_EXCEPTION_ADMIN_NOTE = "やむを得ない場合は、管理者へ相談してください。"
+
+# 個別判断・承認が必要な問い合わせを示す語
+INDIVIDUAL_APPROVAL_PHRASES: tuple[str, ...] = (
+    "大丈夫ですか",
+    "いいですか",
+    "してもいい",
+    "問題ない",
+    "可能ですか",
+    "承認",
+    "確定",
+)
+
+INDIVIDUAL_ACTION_PHRASES: tuple[str, ...] = (
+    "修正して",
+    "変更して",
+    "直して",
+    "取り消して",
+    "訂正して",
+)
+
+# 個人の状況・具体時刻を示す語（制度確認と区別する）
+PERSONAL_CONTEXT_KEYWORDS: tuple[str, ...] = (
+    "昨日",
+    "今日",
+    "明日",
+    "明後日",
+    "来週",
+    "退勤",
+    "出勤",
+    "18時",
+    "19時",
+    "9時",
+    "10時",
+    "時に",
+    "時へ",
+    "時で",
 )
 
 # ルール検索の閾値
@@ -225,6 +282,12 @@ HANDOFF_TEMPLATES: dict[str, str] = {
         "・午前休 / 午後休 のどちらか\n"
         "・取得理由（任意）\n"
     ),
+    CATEGORY_PAID_LEAVE: (
+        "【担当者へ回すときのメモ】\n"
+        "・対象日\n"
+        "・有給 / 休暇の種別\n"
+        "・取得理由（任意）\n"
+    ),
     CATEGORY_HOLIDAY_WORK: (
         "【担当者へ回すときのメモ】\n"
         "・対象日時\n"
@@ -257,7 +320,7 @@ def build_inquiry_context(
 ) -> str:
     """
     直近の会話と現在の入力を1つの文字列にまとめる。
-    種別・カテゴリ判定および LLM への質問文に使う（判定関数自体は変更しない）。
+    意図理解・ルール検索・LLM 回答生成で使う。
     """
     recent = get_recent_history(history, max_messages)
     lines: list[str] = []
@@ -325,35 +388,10 @@ def needs_clock_type_clarification(conversation_text: str) -> bool:
 
 def needs_leave_date_clarification(conversation_text: str) -> bool:
     """有給・休暇の取得希望で、取得予定日などが会話上まだ特定できない場合。"""
-    if not any(kw in conversation_text for kw in ("有給", "有休", "休暇", "休み", "午前休", "午後休", "半休")):
+    if not any(kw in conversation_text for kw in LEAVE_KEYWORDS):
         return False
-    date_hints = (
-        "今日",
-        "明日",
-        "明後日",
-        "来週",
-        "再来週",
-        "来月",
-        "月曜",
-        "火曜",
-        "水曜",
-        "木曜",
-        "金曜",
-        "土曜",
-        "日曜",
-        "取得予定",
-        "予定日",
-        "年",
-        "/",
-        "日から",
-        "日まで",
-        "日に",
-    )
-    if any(hint in conversation_text for hint in date_hints):
+    if _leave_date_present(conversation_text):
         return False
-    for day in range(1, 32):
-        if f"{day}日" in conversation_text:
-            return False
     return True
 
 
@@ -366,6 +404,12 @@ def should_request_clarification(
     if not intent_result or already_asked_clarification(conversation_history):
         return False
     if intent_result.needs_clarification:
+        # 会話上すでに取得日などが分かっている場合は追加質問しない
+        if (
+            intent_result.intent == "leave"
+            and not needs_leave_date_clarification(intent_context)
+        ):
+            return False
         return True
     if (
         intent_result.intent in ("attendance_correction", "insufficient_info")
@@ -403,7 +447,7 @@ def trim_stored_messages(
 
 
 def classify(text: str) -> str:
-    """問い合わせ文を1カテゴリに分類する。"""
+    """短い返答かどうかの判定用（resolve_inquiry_text の履歴混ぜ込み判定のみ）。"""
     if not text or not text.strip():
         return OTHER
 
@@ -483,16 +527,85 @@ def load_rules() -> dict[str, str]:
     return sections
 
 
-def get_rule_answer(category: str, rules: dict[str, str]) -> str | None:
-    """
-    カテゴリ名に一致するセクション本文を返す。
-    rules.txt に [カテゴリ名] が無い、または本文が空なら None。
-    """
-    text = rules.get(category)
-    if text is None:
-        return None
-    text = text.strip()
-    return text if text else None
+def _leave_date_present(text: str) -> bool:
+    """会話文脈に取得予定日・時期が含まれるか。"""
+    date_hints = (
+        "今日",
+        "明日",
+        "明後日",
+        "来週",
+        "再来週",
+        "来月",
+        "月曜",
+        "火曜",
+        "水曜",
+        "木曜",
+        "金曜",
+        "土曜",
+        "日曜",
+        "取得予定",
+        "予定日",
+        "/",
+        "日から",
+        "日まで",
+        "日に",
+    )
+    if any(hint in text for hint in date_hints):
+        return True
+    for day in range(1, 32):
+        if f"{day}日" in text:
+            return True
+    return False
+
+
+def should_provide_leave_rules(intent_context: str) -> bool:
+    """有給・有休の取得に関する問い合わせで、ルール説明を返すべきケース。"""
+    if is_leave_policy_question(intent_context):
+        return True
+    if not any(kw in intent_context for kw in LEAVE_KEYWORDS):
+        return False
+    if _leave_date_present(intent_context) and any(
+        kw in intent_context for kw in ("取れる", "取りたい", "休める", "取得", "休み")
+    ):
+        return True
+    return False
+
+
+def should_append_leave_exception_note(
+    intent_context: str,
+    history: list[dict[str, str]] | None = None,
+) -> bool:
+    """取得可否の相談で、管理者への例外相談案内を付けるケース。"""
+    if is_leave_clarification_followup(history):
+        return True
+    if is_leave_policy_question(intent_context):
+        return False
+    return (
+        _leave_date_present(intent_context)
+        and any(kw in intent_context for kw in LEAVE_KEYWORDS)
+        and any(
+            kw in intent_context
+            for kw in ("取れる", "取りたい", "休める", "取得", "休み")
+        )
+    )
+
+
+def is_leave_clarification_followup(
+    history: list[dict[str, str]] | None,
+) -> bool:
+    """有給・有休の取得日確認の直後に、ユーザーが日付等を答えたか。"""
+    if not already_asked_clarification(history):
+        return False
+    for msg in reversed(history or []):
+        if msg.get("role") == "assistant":
+            if not msg.get("is_clarification"):
+                return False
+            content = msg.get("content", "")
+            return any(
+                kw in content
+                for kw in ("有給", "有休", "取得予定", "休暇", "休み", "いつ")
+            )
+    return False
 
 
 def is_leave_policy_question(query: str) -> bool:
@@ -515,11 +628,22 @@ def is_leave_policy_question(query: str) -> bool:
     )
 
 
-def is_attendance_inquiry(query: str, intent: str | None) -> bool:
+def is_attendance_inquiry(
+    query: str,
+    intent: str | None,
+    conversation_context: str | None = None,
+) -> bool:
     """勤怠に関する問い合わせかどうか（勤怠外はルール検索前に除外）。"""
+    context = conversation_context or query
     if any(kw in query for kw in NON_ATTENDANCE_KEYWORDS):
         return False
     if intent == "other":
+        if should_provide_leave_rules(context):
+            return True
+        if any(kw in context for kw in ATTENDANCE_DOMAIN_KEYWORDS):
+            return True
+        if any(kw in context for kw in LEAVE_KEYWORDS):
+            return True
         return False
     if intent in (
         "attendance_correction",
@@ -529,8 +653,52 @@ def is_attendance_inquiry(query: str, intent: str | None) -> bool:
     ):
         return True
     if intent in ("rule_check", None):
-        return any(kw in query for kw in ATTENDANCE_DOMAIN_KEYWORDS)
+        if any(kw in context for kw in ATTENDANCE_DOMAIN_KEYWORDS):
+            return True
+        if should_provide_leave_rules(context):
+            return True
     return False
+
+
+def is_holiday_work_inquiry(text: str) -> bool:
+    """休日出勤に関する問い合わせか。"""
+    return any(
+        kw in text
+        for kw in RULE_SECTION_KEYWORDS[CATEGORY_HOLIDAY_WORK]
+    )
+
+
+def is_holiday_work_policy_question(text: str) -> bool:
+    """休日出勤の制度・申請手続きに関するルール確認か。"""
+    if not is_holiday_work_inquiry(text):
+        return False
+    return any(
+        kw in text
+        for kw in (
+            "申請",
+            "方法",
+            "ルール",
+            "教えて",
+            "について",
+            "記載",
+            "届出",
+            "備考",
+            "できますか",
+            "確認",
+        )
+    )
+
+
+def resolve_search_intent(
+    intent: str | None,
+    category_hint: str | None,
+) -> str | None:
+    """ルール検索用 intent。カテゴリが特定できていれば rule_check として検索する。"""
+    if category_hint and category_hint != OTHER:
+        return "rule_check"
+    if intent == "other":
+        return "rule_check"
+    return intent
 
 
 def _has_direct_section_match(section_name: str, query: str) -> bool:
@@ -706,6 +874,43 @@ def resolve_handoff_category(
     return OTHER
 
 
+def requires_individual_handling(
+    query: str,
+    intent: str | None,
+    conversation_context: str | None = None,
+) -> bool:
+    """
+    LLM だけで確定させず、管理者確認が必要なケースかどうか。
+
+    打刻修正の承認・勤怠実績の確定・有給取得の最終可否などを含む。
+    制度・手続きの一般確認（申請期限など）は False。
+    """
+    context = conversation_context or query
+    if should_provide_leave_rules(context):
+        return False
+    if is_leave_policy_question(query) or is_leave_policy_question(context):
+        return False
+    if is_holiday_work_policy_question(context):
+        return False
+
+    if intent == "needs_individual_handling":
+        return True
+    if intent == "attendance_correction":
+        return True
+    if intent == "leave" and not is_holiday_work_inquiry(context):
+        return True
+
+    has_approval = any(p in query for p in INDIVIDUAL_APPROVAL_PHRASES)
+    has_personal = any(p in query for p in PERSONAL_CONTEXT_KEYWORDS)
+    if has_approval and has_personal:
+        return True
+
+    if any(p in query for p in INDIVIDUAL_ACTION_PHRASES):
+        return True
+
+    return False
+
+
 def build_handoff_message(category: str) -> str:
     """管理者確認案内メッセージを組み立てる。"""
     template_body = handoff_template_for_category(category)
@@ -713,7 +918,7 @@ def build_handoff_message(category: str) -> str:
     if template_body.startswith(header):
         template_body = template_body[len(header) :]
     return (
-        "管理者に確認してください。\n"
+        f"{INDIVIDUAL_HANDOFF_INTRO}\n"
         "確認前に以下を整理してください:\n"
         f"{template_body}"
     )
@@ -742,10 +947,11 @@ def generate_answer(
         (回答文, マッチしたルールブロックのリスト)
     """
     query_for_search = conversation_context or user_input
+    search_intent = resolve_search_intent(intent, category_hint)
     matched_rules = search_rules(
         query_for_search,
         rules=rules,
-        intent=intent,
+        intent=search_intent,
         category_hint=category_hint,
     )
     if not matched_rules:
@@ -760,6 +966,24 @@ def generate_answer(
     return (answer, matched_rules)
 
 
+def complete_handoff_result(
+    result: dict[str, str | dict[str, str | bool] | None | bool],
+    inquiry_text: str,
+    intent_name: str | None,
+    legacy_category: str,
+    reason: str = "個別確認",
+) -> dict[str, str | dict[str, str | bool] | None | bool]:
+    """管理者確認テンプレート付きで result を完成させる。"""
+    handoff_category = resolve_handoff_category(
+        inquiry_text, intent_name, legacy_category
+    )
+    dev_log_llm(called=False, reason=reason)
+    result["type"] = result_type_for_intent(intent_name)
+    result["category"] = handoff_category
+    result["message"] = build_handoff_message(handoff_category)
+    return result
+
+
 def complete_rule_check_result(
     result: dict[str, str | dict[str, str | bool] | None | bool],
     inquiry_text: str,
@@ -767,6 +991,8 @@ def complete_rule_check_result(
     rule_data: dict[str, str],
     intent_name: str | None,
     category_hint: str | None,
+    legacy_category: str,
+    message_suffix: str | None = None,
 ) -> dict[str, str | dict[str, str | bool] | None | bool]:
     """ルール検索 → LLM 回答生成までを行い、result を完成させる。"""
     answer, matched_rules = generate_answer(
@@ -776,12 +1002,22 @@ def complete_rule_check_result(
         category_hint=category_hint,
         conversation_context=intent_context,
     )
+    if not matched_rules:
+        return complete_handoff_result(
+            result,
+            inquiry_text,
+            intent_name,
+            legacy_category,
+            reason="ルール未該当",
+        )
     result["type"] = RULE_CHECK
-    if matched_rules:
-        section = _section_name_from_rule_block(matched_rules[0])
-        if section:
-            result["category"] = section
-    result["message"] = f"回答: {answer}"
+    section = _section_name_from_rule_block(matched_rules[0])
+    if section:
+        result["category"] = section
+    message = f"回答: {answer}"
+    if message_suffix:
+        message = f"{message}\n{message_suffix}"
+    result["message"] = message
     return result
 
 
@@ -812,13 +1048,12 @@ def process_inquiry(
     intent_result = analyze_intent(intent_context)
     intent_name = intent_result.intent if intent_result else None
 
-    # 旧カテゴリ判定は補助情報（検索精度・UI 表示用）。主経路では必須にしない。
-    legacy_type = classify(inquiry_text)
+    # キーワード分類は検索精度・履歴解決の補助のみ（主経路は LLM 意図理解）
     legacy_category = classify_category(inquiry_text)
     category_hint = legacy_category if legacy_category != OTHER else None
 
     result: dict[str, str | dict[str, str | bool] | None | bool] = {
-        "type": legacy_type,
+        "type": result_type_for_intent(intent_name),
         "category": legacy_category,
         "intent_analysis": (
             intent_analysis_to_dict(intent_result) if intent_result else None
@@ -835,19 +1070,17 @@ def process_inquiry(
         result["message"] = clarification_message(intent_result, intent_context)
         return result
 
-    if not is_attendance_inquiry(inquiry_text, intent_name):
+    if not is_attendance_inquiry(inquiry_text, intent_name, intent_context):
         dev_log_llm(called=False, reason="勤怠外")
         result["type"] = OTHER
         result["message"] = OUT_OF_SCOPE_MESSAGE
         return result
 
-    # --- 主経路: 意図理解 → ルール検索 → LLM 回答 / 管理者案内 ---
-    if intent_name in ("rule_check", None):
-        return complete_rule_check_result(
-            result, inquiry_text, intent_context, rule_data, intent_name, category_hint
-        )
-
-    if intent_name == "leave" and is_leave_policy_question(inquiry_text):
+    # 有給・有休: 取得日が分かった／制度確認 → 有給ルールを返す
+    if (
+        should_provide_leave_rules(intent_context)
+        or is_leave_clarification_followup(conversation_history)
+    ):
         return complete_rule_check_result(
             result,
             inquiry_text,
@@ -855,21 +1088,57 @@ def process_inquiry(
             rule_data,
             "rule_check",
             CATEGORY_PAID_LEAVE,
+            legacy_category,
+            message_suffix=(
+                LEAVE_EXCEPTION_ADMIN_NOTE
+                if should_append_leave_exception_note(
+                    intent_context, conversation_history
+                )
+                else None
+            ),
         )
 
-    if intent_name in ("attendance_correction", "leave", "needs_individual_handling"):
-        handoff_category = resolve_handoff_category(
-            inquiry_text, intent_name, legacy_category
+    if (
+        category_hint == CATEGORY_HOLIDAY_WORK
+        or is_holiday_work_policy_question(intent_context)
+    ):
+        return complete_rule_check_result(
+            result,
+            inquiry_text,
+            intent_context,
+            rule_data,
+            "rule_check",
+            CATEGORY_HOLIDAY_WORK,
+            legacy_category,
         )
-        dev_log_llm(called=False, reason=f"意図={intent_name}")
-        result["type"] = result_type_for_intent(intent_name)
-        result["category"] = handoff_category
-        result["message"] = build_handoff_message(handoff_category)
-        return result
 
-    # insufficient_info 等: ルール検索を試み、なければ該当なし
+    if requires_individual_handling(
+        inquiry_text, intent_name, intent_context
+    ):
+        return complete_handoff_result(
+            result, inquiry_text, intent_name, legacy_category
+        )
+
+    if intent_name in ("rule_check", None):
+        return complete_rule_check_result(
+            result,
+            inquiry_text,
+            intent_context,
+            rule_data,
+            resolve_search_intent(intent_name, category_hint),
+            category_hint,
+            legacy_category,
+        )
+
+    # insufficient_info 等: ルール検索を試み、なければ管理者案内
     return complete_rule_check_result(
-        result, inquiry_text, intent_context, rule_data, intent_name, category_hint
+        result,
+        inquiry_text,
+        intent_context,
+        rule_data,
+        resolve_search_intent(intent_name, category_hint),
+        category_hint,
+        legacy_category,
     )
 
 
