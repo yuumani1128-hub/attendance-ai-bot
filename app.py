@@ -643,7 +643,8 @@ def run_app() -> None:
 
     render_chat_history()
 
-    render_suggested_questions()
+    if not st.session_state.messages:
+        render_suggested_questions()
 
     user_input = st.chat_input("質問を入力してください…")
     if user_input:
