@@ -54,6 +54,12 @@ class IntentAnalysis(BaseModel):
     needs_clarification: bool = Field(
         description="追加で1回ユーザーへ確認すべき情報がある場合 true"
     )
+    clarification_question: str = Field(
+        description=(
+            "needs_clarification=true のとき、ユーザーへ1回だけ聞く追加質問（日本語・1文）。"
+            "false のときは空文字。"
+        )
+    )
     reason: str = Field(description="意図判定の理由（日本語・簡潔）")
 
 
@@ -67,8 +73,19 @@ INTENT_SYSTEM_PROMPT = (
     "insufficient_info=意図は推測できるが回答に必要な情報が不足。"
     "other=上記に当てはまらない。"
     "needs_clarification は、1回の追加質問で足りる情報が欠けている場合 true。"
+    "needs_clarification=true のとき clarification_question に、"
+    "不足情報を1回で聞き切る自然な日本語の質問を1文で書く。"
+    "打刻漏れ・打刻忘れの報告で、出勤/退勤/休憩のどれかが不明なら"
+    "needs_clarification=true、intent=insufficient_info とし、"
+    "例:「出勤と退勤、どちらの打刻でしょうか？」と聞く。"
+    "有給・休暇の取得希望で、取得予定日や期間が不明なら"
+    "needs_clarification=true、intent=leave とし、"
+    "例:「有給取得についてですね。いつ取得予定ですか？」と聞く。"
+    "取得予定日や曜日・時期が会話に含まれている場合は needs_clarification=false。"
     "reason には判定理由を日本語で簡潔に書く。"
     "会話履歴に既にある情報を再度不足としない。"
+    "直前のアシスタントが追加質問をしており、ユーザーが答えている場合は"
+    "needs_clarification=false にする。"
 )
 
 
@@ -103,6 +120,7 @@ def dev_log_intent_analysis(analysis: IntentAnalysis | None, reason: str = "") -
     payload = {
         "intent": analysis.intent,
         "needs_clarification": analysis.needs_clarification,
+        "clarification_question": analysis.clarification_question,
         "reason": analysis.reason,
     }
     logger.info("意図理解: %s", json.dumps(payload, ensure_ascii=False))
@@ -113,6 +131,7 @@ def intent_analysis_to_dict(analysis: IntentAnalysis) -> dict[str, str | bool]:
     return {
         "intent": analysis.intent,
         "needs_clarification": analysis.needs_clarification,
+        "clarification_question": analysis.clarification_question,
         "reason": analysis.reason,
     }
 

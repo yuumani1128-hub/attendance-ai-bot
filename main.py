@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from llm import analyze_intent, dev_log_llm, generate_llm_response, intent_analysis_to_dict
+from llm import analyze_intent, dev_log_llm, ensure_dev_logging, generate_llm_response, intent_analysis_to_dict
+
+logger = logging.getLogger("attendance_bot")
 
 # 分類ラベル
 RULE_CHECK = "ルール確認"
 MISTAKE_REPORT = "勤怠ミス報告"
+CLARIFICATION = "追加確認"
 OTHER = "その他"
 
 # カテゴリ分類ラベル
@@ -89,6 +93,46 @@ CATEGORY_KEYWORDS = (
         ("記載ミス", "記載", "入力ミス", "間違", "誤記", "訂正", "修正"),
     ),
 )
+
+# rules.txt 各セクションの検索用キーワード（自然言語問い合わせとの照合）
+RULE_SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
+    CATEGORY_LATE: ("遅刻", "遅れ", "遅れます", "間に合わない"),
+    CATEGORY_TRAIN_DELAY: ("電車遅延", "電車", "遅延", "遅延証明", "人身事故", "運転見合わせ"),
+    CATEGORY_CLOCK_MISS: (
+        "打刻漏れ",
+        "打刻忘れ",
+        "打刻を忘れ",
+        "打刻し忘れ",
+        "打刻",
+        "押し忘れ",
+        "勤怠漏れ",
+        "忘れ",
+        "退勤",
+        "出勤",
+    ),
+    CATEGORY_DESCRIPTION_MISTAKE: ("記載ミス", "記載", "入力ミス", "誤記", "誤入力"),
+    CATEGORY_HALF_DAY_OFF: ("午前休", "午後休", "半休", "午前だけ", "午後だけ"),
+    CATEGORY_HOLIDAY_WORK: ("休日出勤", "休日勤務", "土日出勤", "祝日出勤", "休出"),
+}
+
+# 意図理解結果から検索候補セクションを絞り込む（None=全セクション、()=ルール検索しない）
+INTENT_SECTION_CANDIDATES: dict[str, tuple[str, ...] | None] = {
+    "rule_check": None,
+    "attendance_correction": (CATEGORY_CLOCK_MISS, CATEGORY_DESCRIPTION_MISTAKE),
+    "leave": (CATEGORY_HALF_DAY_OFF,),
+    "needs_individual_handling": (),
+    "insufficient_info": None,
+    "other": (),
+}
+
+# ルール検索の閾値
+MIN_RULE_SEARCH_SCORE = 8
+MAX_RULE_SEARCH_RESULTS = 3
+# 最高スコアとの差がこの値より大きい候補は、関連性が低いとみなして除外
+SCORE_RELATIVE_GAP = 10
+
+# セクション横断で共通のため、本文ラベル一致の加点対象外
+GENERIC_BODY_LABELS = frozenset({"時刻", "届出", "備考欄", "その他"})
 
 # 人に回す（担当者へ渡す）ときに、そのカテゴリで揃えてほしい情報のテンプレ。
 # キーは classify_category() が返すカテゴリ名と一致させます。
@@ -199,6 +243,94 @@ def build_intent_context(
     return build_inquiry_context(history, current_input, user_only=False)
 
 
+def already_asked_clarification(history: list[dict[str, str]] | None) -> bool:
+    """直近のアシスタント発言が追加確認だったかどうか。"""
+    if not history:
+        return False
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            return bool(msg.get("is_clarification"))
+    return False
+
+
+def needs_clock_type_clarification(conversation_text: str) -> bool:
+    """打刻漏れ報告で、出勤/退勤/休憩のどれかが会話上まだ特定できない場合。"""
+    if not any(kw in conversation_text for kw in ("打刻", "忘れ", "漏れ")):
+        return False
+    if any(kw in conversation_text for kw in ("出勤", "退勤", "休憩")):
+        return False
+    return True
+
+
+def needs_leave_date_clarification(conversation_text: str) -> bool:
+    """有給・休暇の取得希望で、取得予定日などが会話上まだ特定できない場合。"""
+    if not any(kw in conversation_text for kw in ("有給", "休暇", "休み", "午前休", "午後休", "半休")):
+        return False
+    date_hints = (
+        "今日",
+        "明日",
+        "明後日",
+        "来週",
+        "再来週",
+        "来月",
+        "月曜",
+        "火曜",
+        "水曜",
+        "木曜",
+        "金曜",
+        "土曜",
+        "日曜",
+        "取得予定",
+        "予定日",
+        "年",
+        "/",
+        "日から",
+        "日まで",
+        "日に",
+    )
+    if any(hint in conversation_text for hint in date_hints):
+        return False
+    for day in range(1, 32):
+        if f"{day}日" in conversation_text:
+            return False
+    return True
+
+
+def should_request_clarification(
+    intent_result,
+    conversation_history: list[dict[str, str]] | None,
+    intent_context: str,
+) -> bool:
+    """追加確認が必要かどうか（LLM 判定 + 最小限のフォールバック）。"""
+    if not intent_result or already_asked_clarification(conversation_history):
+        return False
+    if intent_result.needs_clarification:
+        return True
+    if (
+        intent_result.intent in ("attendance_correction", "insufficient_info")
+        and needs_clock_type_clarification(intent_context)
+    ):
+        return True
+    if intent_result.intent == "leave" and needs_leave_date_clarification(intent_context):
+        return True
+    return False
+
+
+def clarification_message(intent_result, intent_context: str = "") -> str:
+    """意図理解結果から、ユーザーへ返す追加質問文を作る。"""
+    question = intent_result.clarification_question.strip()
+    if question:
+        return question
+    if needs_clock_type_clarification(intent_context):
+        return "出勤と退勤、どちらの打刻でしょうか？"
+    if intent_result.intent == "leave" and needs_leave_date_clarification(intent_context):
+        return "有給取得についてですね。いつ取得予定ですか？"
+    reason = intent_result.reason.strip()
+    if reason:
+        return f"確認させてください。{reason}"
+    return "もう少し詳しく教えてください。"
+
+
 def trim_stored_messages(
     messages: list[dict[str, str]],
     max_messages: int = MAX_STORED_MESSAGES,
@@ -302,12 +434,162 @@ def get_rule_answer(category: str, rules: dict[str, str]) -> str | None:
     return text if text else None
 
 
-def generate_answer(user_input: str, category: str, rules: dict[str, str]) -> str:
+def dev_log_rule_search(
+    query: str,
+    intent: str | None,
+    matches: list[tuple[str, int]],
+) -> None:
+    """ルール検索結果を開発用ログに出す（本番 UI には表示しない）。"""
+    ensure_dev_logging()
+    if not matches:
+        logger.info(
+            "ルール検索: query=%r intent=%s 件数=0 sections=[]",
+            query,
+            intent or "-",
+        )
+        return
+    sections = [f"{name}(score={score})" for name, score in matches]
+    logger.info(
+        "ルール検索: query=%r intent=%s 件数=%d sections=%s",
+        query,
+        intent or "-",
+        len(matches),
+        sections,
+    )
+
+
+def _intent_search_candidates(intent: str | None) -> set[str] | None:
+    """
+    intent に応じて検索対象セクションを絞る。
+    None=全セクション、set()=検索しない。
+    """
+    if intent is None:
+        return None
+    candidates = INTENT_SECTION_CANDIDATES.get(intent)
+    if candidates is None:
+        return None
+    return set(candidates)
+
+
+def _format_rule_section(section_name: str, body: str) -> str:
+    """LLM に渡す1セクション分のテキスト。"""
+    return f"[{section_name}]\n{body.strip()}"
+
+
+def _score_rule_section(
+    section_name: str,
+    body: str,
+    query: str,
+    category_hint: str | None = None,
+) -> int:
+    """問い合わせ文とセクションの関連度スコア（セクション固有キーワードのみ）。"""
+    score = 0
+
+    if section_name in query:
+        score += 10
+
+    matched_keywords = 0
+    for keyword in RULE_SECTION_KEYWORDS.get(section_name, (section_name,)):
+        if keyword in query:
+            score += 5
+            matched_keywords += 1
+
+    # セクション固有の本文ラベルのみ加点（「届出」「備考欄」等の汎用語は除外）
+    for line in body.splitlines():
+        label = line.split("：", 1)[0].strip()
+        if label in GENERIC_BODY_LABELS:
+            continue
+        if len(label) >= 2 and label in query:
+            score += 3
+
+    if category_hint and category_hint != OTHER and category_hint == section_name:
+        score += 8
+
+    # キーワード一致が1件も無く、セクション名も無い場合は加点しない
+    if matched_keywords == 0 and section_name not in query:
+        if not (category_hint and category_hint == section_name):
+            return 0
+
+    return score
+
+
+def search_rules(
+    query: str,
+    rules: dict[str, str] | None = None,
+    intent: str | None = None,
+    category_hint: str | None = None,
+    max_results: int = MAX_RULE_SEARCH_RESULTS,
+) -> list[str]:
+    """
+    自然言語の問い合わせから関連ルールを検索し、セクション単位のリストを返す。
+
+    intent は検索対象セクションの絞り込みに使う補助情報。
+    関連度が MIN_RULE_SEARCH_SCORE 未満の場合は空リストを返す。
+    """
+    rule_data = load_rules() if rules is None else rules
+    if not rule_data or not query.strip():
+        dev_log_rule_search(query, intent, [])
+        return []
+
+    candidate_sections = _intent_search_candidates(intent)
+    if candidate_sections is not None and not candidate_sections:
+        dev_log_rule_search(query, intent, [])
+        return []
+
+    scored: list[tuple[str, str, int]] = []
+    for section_name, body in rule_data.items():
+        if candidate_sections is not None and section_name not in candidate_sections:
+            continue
+        body = body.strip()
+        if not body:
+            continue
+        score = _score_rule_section(section_name, body, query, category_hint)
+        if score > 0:
+            scored.append((section_name, body, score))
+
+    scored.sort(key=lambda item: item[2], reverse=True)
+    qualified = [
+        (name, body, score)
+        for name, body, score in scored
+        if score >= MIN_RULE_SEARCH_SCORE
+    ]
+
+    if not qualified:
+        dev_log_rule_search(query, intent, [])
+        return []
+
+    best_score = qualified[0][2]
+    selected: list[tuple[str, int]] = []
+    for name, body, score in qualified:
+        if len(selected) >= max_results:
+            break
+        if selected and score < best_score - SCORE_RELATIVE_GAP:
+            break
+        selected.append((name, score))
+
+    dev_log_rule_search(query, intent, selected)
+    body_by_name = {name: body for name, body, _ in qualified}
+    return [_format_rule_section(name, body_by_name[name]) for name, _ in selected]
+
+
+def generate_answer(
+    user_input: str,
+    category: str,
+    rules: dict[str, str],
+    intent: str | None = None,
+) -> str:
     """ルール確認向けの回答文を LLM で生成する（関連ルールのみ API に送信）。"""
-    rule_context = get_rule_answer(category, rules)
-    if rule_context is None:
+    category_hint = category if category != OTHER else None
+    matched_rules = search_rules(
+        user_input,
+        rules=rules,
+        intent=intent,
+        category_hint=category_hint,
+    )
+    if not matched_rules:
         dev_log_llm(called=False, reason="ルール未該当")
         return "該当するルールが見つかりません。管理者に確認してください。"
+    rule_context = "\n\n".join(matched_rules)
     return generate_llm_response(user_input, rule_context)
 
 
@@ -315,7 +597,7 @@ def process_inquiry(
     user_input: str,
     rules: dict[str, str] | None = None,
     conversation_history: list[dict[str, str]] | None = None,
-) -> dict[str, str | dict[str, str | bool] | None]:
+) -> dict[str, str | dict[str, str | bool] | None | bool]:
     """
     1件の問い合わせを処理して、画面表示に必要な結果をまとめて返す。
 
@@ -338,16 +620,29 @@ def process_inquiry(
     inquiry_type = classify(inquiry_text)
     inquiry_category = classify_category(inquiry_text)
 
-    result: dict[str, str | dict[str, str | bool] | None] = {
+    result: dict[str, str | dict[str, str | bool] | None | bool] = {
         "type": inquiry_type,
         "category": inquiry_category,
         "intent_analysis": (
             intent_analysis_to_dict(intent_result) if intent_result else None
         ),
+        "is_clarification": False,
     }
 
+    if intent_result and should_request_clarification(
+        intent_result, conversation_history, intent_context
+    ):
+        dev_log_llm(called=False, reason="追加確認")
+        result["type"] = CLARIFICATION
+        result["is_clarification"] = True
+        result["message"] = clarification_message(intent_result, intent_context)
+        return result
+
     if inquiry_type == RULE_CHECK:
-        result["message"] = f"回答: {generate_answer(inquiry_text, inquiry_category, rule_data)}"
+        intent_name = intent_result.intent if intent_result else None
+        result["message"] = (
+            f"回答: {generate_answer(inquiry_text, inquiry_category, rule_data, intent=intent_name)}"
+        )
     else:
         dev_log_llm(called=False, reason=f"種別={inquiry_type}")
         template_body = handoff_template_for_category(inquiry_category)

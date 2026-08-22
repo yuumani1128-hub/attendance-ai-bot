@@ -391,6 +391,10 @@ def format_assistant_html(
     """
     safe_content = html.escape(content)
 
+    # 追加確認：自然な1文の質問として表示
+    if inquiry_type == "追加確認":
+        return f'<div class="info-card plain"><p>{safe_content}</p></div>'
+
     # ルール確認：ラベル/値の行があれば情報カード化
     if inquiry_type == "ルール確認":
         rows = _parse_label_value_lines(content)
@@ -486,6 +490,7 @@ def process_and_append_message(text: str) -> None:
             "content": bot_reply,
             "inquiry_type": result["type"],
             "category": result["category"],
+            "is_clarification": bool(result.get("is_clarification")),
         }
     )
 
