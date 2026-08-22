@@ -22,6 +22,7 @@ CATEGORY_LATE = "遅刻"
 CATEGORY_TRAIN_DELAY = "電車遅延"
 CATEGORY_HALF_DAY_OFF = "午前休/午後休"
 CATEGORY_HOLIDAY_WORK = "休日出勤"
+CATEGORY_PAID_LEAVE = "有給"
 
 # 勤怠ミス報告（「報告」単体はルール確認と被りやすいので、ミス系を優先）
 MISTAKE_KEYWORDS = (
@@ -111,6 +112,18 @@ RULE_SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
         "出勤",
     ),
     CATEGORY_DESCRIPTION_MISTAKE: ("記載ミス", "記載", "入力ミス", "誤記", "誤入力"),
+    CATEGORY_PAID_LEAVE: (
+        "有給",
+        "年休",
+        "年次有給",
+        "休暇",
+        "休みたい",
+        "休み",
+        "申請期限",
+        "申請",
+        "取得",
+        "取得希望",
+    ),
     CATEGORY_HALF_DAY_OFF: ("午前休", "午後休", "半休", "午前だけ", "午後だけ"),
     CATEGORY_HOLIDAY_WORK: ("休日出勤", "休日勤務", "土日出勤", "祝日出勤", "休出"),
 }
@@ -119,11 +132,56 @@ RULE_SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
 INTENT_SECTION_CANDIDATES: dict[str, tuple[str, ...] | None] = {
     "rule_check": None,
     "attendance_correction": (CATEGORY_CLOCK_MISS, CATEGORY_DESCRIPTION_MISTAKE),
-    "leave": (CATEGORY_HALF_DAY_OFF,),
+    "leave": (CATEGORY_PAID_LEAVE, CATEGORY_HALF_DAY_OFF),
     "needs_individual_handling": (),
     "insufficient_info": None,
     "other": (),
 }
+
+# 勤怠ドメイン語（rule_check 時に勤怠関連か判定する）
+ATTENDANCE_DOMAIN_KEYWORDS: tuple[str, ...] = (
+    "有給",
+    "年休",
+    "休暇",
+    "休み",
+    "打刻",
+    "遅刻",
+    "早退",
+    "出勤",
+    "退勤",
+    "勤怠",
+    "残業",
+    "休出",
+    "休日出勤",
+    "午前休",
+    "午後休",
+    "半休",
+    "電車遅延",
+    "届出",
+    "申請",
+    "記載",
+    "修正",
+    "忘れ",
+    "漏れ",
+)
+
+# 勤怠外と判断する語
+NON_ATTENDANCE_KEYWORDS: tuple[str, ...] = (
+    "ランチ",
+    "おすすめ",
+    "コンビニ",
+    "レストラン",
+    "昼食",
+    "夕食",
+    "食事",
+    "天気",
+    "株価",
+)
+
+OUT_OF_SCOPE_MESSAGE = (
+    "勤怠に関するご質問に回答できます。"
+    "ランチや社内施設など、勤怠ルール以外の内容にはお答えできません。"
+)
 
 # ルール検索の閾値
 MIN_RULE_SEARCH_SCORE = 8
@@ -434,6 +492,53 @@ def get_rule_answer(category: str, rules: dict[str, str]) -> str | None:
     return text if text else None
 
 
+def is_leave_policy_question(query: str) -> bool:
+    """有給・休暇の制度・期限に関するルール確認か（取得申告ではない）。"""
+    if not any(kw in query for kw in ("有給", "年休", "休暇", "休み")):
+        return False
+    return any(
+        kw in query
+        for kw in (
+            "いつまで",
+            "何日前",
+            "申請期限",
+            "期限",
+            "ルール",
+            "方法",
+            "教えて",
+            "確認",
+            "できますか",
+        )
+    )
+
+
+def is_attendance_inquiry(query: str, intent: str | None) -> bool:
+    """勤怠に関する問い合わせかどうか（勤怠外はルール検索前に除外）。"""
+    if any(kw in query for kw in NON_ATTENDANCE_KEYWORDS):
+        return False
+    if intent == "other":
+        return False
+    if intent in (
+        "attendance_correction",
+        "leave",
+        "needs_individual_handling",
+        "insufficient_info",
+    ):
+        return True
+    if intent in ("rule_check", None):
+        return any(kw in query for kw in ATTENDANCE_DOMAIN_KEYWORDS)
+    return False
+
+
+def _has_direct_section_match(section_name: str, query: str) -> bool:
+    """問い合わせ文にセクション名またはセクション固有キーワードが含まれるか。"""
+    if section_name in query:
+        return True
+    return any(
+        kw in query for kw in RULE_SECTION_KEYWORDS.get(section_name, (section_name,))
+    )
+
+
 def dev_log_rule_search(
     query: str,
     intent: str | None,
@@ -551,7 +656,7 @@ def search_rules(
     qualified = [
         (name, body, score)
         for name, body, score in scored
-        if score >= MIN_RULE_SEARCH_SCORE
+        if score >= MIN_RULE_SEARCH_SCORE and _has_direct_section_match(name, query)
     ]
 
     if not qualified:
@@ -572,14 +677,66 @@ def search_rules(
     return [_format_rule_section(name, body_by_name[name]) for name, _ in selected]
 
 
+def _section_name_from_rule_block(rule_block: str) -> str | None:
+    """search_rules が返す `[セクション名]\\n...` 形式からセクション名を取り出す。"""
+    if rule_block.startswith("[") and "]" in rule_block:
+        return rule_block[1 : rule_block.index("]")].strip()
+    return None
+
+
+def resolve_handoff_category(
+    inquiry_text: str,
+    intent: str | None,
+    legacy_category: str,
+) -> str:
+    """管理者案内テンプレート用カテゴリ（旧 classify_category は補助）。"""
+    if legacy_category != OTHER:
+        return legacy_category
+    if intent == "leave":
+        if any(kw in inquiry_text for kw in ("有給", "年休", "休暇")):
+            return CATEGORY_PAID_LEAVE
+        return CATEGORY_HALF_DAY_OFF
+    if intent == "attendance_correction":
+        if any(kw in inquiry_text for kw in ("記載", "入力ミス", "誤記")):
+            return CATEGORY_DESCRIPTION_MISTAKE
+        return CATEGORY_CLOCK_MISS
+    return OTHER
+
+
+def build_handoff_message(category: str) -> str:
+    """管理者確認案内メッセージを組み立てる。"""
+    template_body = handoff_template_for_category(category)
+    header = "【担当者へ回すときのメモ】\n"
+    if template_body.startswith(header):
+        template_body = template_body[len(header) :]
+    return (
+        "管理者に確認してください。\n"
+        "確認前に以下を整理してください:\n"
+        f"{template_body}"
+    )
+
+
+def result_type_for_intent(intent: str | None) -> str:
+    """意図理解結果から UI 表示用の種別ラベルを決める。"""
+    if intent == "rule_check":
+        return RULE_CHECK
+    if intent == "attendance_correction":
+        return MISTAKE_REPORT
+    return OTHER
+
+
 def generate_answer(
     user_input: str,
-    category: str,
     rules: dict[str, str],
     intent: str | None = None,
-) -> str:
-    """ルール確認向けの回答文を LLM で生成する（関連ルールのみ API に送信）。"""
-    category_hint = category if category != OTHER else None
+    category_hint: str | None = None,
+) -> tuple[str, list[str]]:
+    """
+    ルール確認向けの回答文を LLM で生成する（関連ルールのみ API に送信）。
+
+    Returns:
+        (回答文, マッチしたルールブロックのリスト)
+    """
     matched_rules = search_rules(
         user_input,
         rules=rules,
@@ -588,9 +745,9 @@ def generate_answer(
     )
     if not matched_rules:
         dev_log_llm(called=False, reason="ルール未該当")
-        return "該当するルールが見つかりません。管理者に確認してください。"
+        return ("該当するルールが見つかりません。管理者に確認してください。", [])
     rule_context = "\n\n".join(matched_rules)
-    return generate_llm_response(user_input, rule_context)
+    return (generate_llm_response(user_input, rule_context), matched_rules)
 
 
 def process_inquiry(
@@ -616,13 +773,16 @@ def process_inquiry(
 
     intent_context = build_intent_context(conversation_history, user_input)
     intent_result = analyze_intent(intent_context)
+    intent_name = intent_result.intent if intent_result else None
 
-    inquiry_type = classify(inquiry_text)
-    inquiry_category = classify_category(inquiry_text)
+    # 旧カテゴリ判定は補助情報（検索精度・UI 表示用）。主経路では必須にしない。
+    legacy_type = classify(inquiry_text)
+    legacy_category = classify_category(inquiry_text)
+    category_hint = legacy_category if legacy_category != OTHER else None
 
     result: dict[str, str | dict[str, str | bool] | None | bool] = {
-        "type": inquiry_type,
-        "category": inquiry_category,
+        "type": legacy_type,
+        "category": legacy_category,
         "intent_analysis": (
             intent_analysis_to_dict(intent_result) if intent_result else None
         ),
@@ -638,23 +798,67 @@ def process_inquiry(
         result["message"] = clarification_message(intent_result, intent_context)
         return result
 
-    if inquiry_type == RULE_CHECK:
-        intent_name = intent_result.intent if intent_result else None
-        result["message"] = (
-            f"回答: {generate_answer(inquiry_text, inquiry_category, rule_data, intent=intent_name)}"
-        )
-    else:
-        dev_log_llm(called=False, reason=f"種別={inquiry_type}")
-        template_body = handoff_template_for_category(inquiry_category)
-        header = "【担当者へ回すときのメモ】\n"
-        if template_body.startswith(header):
-            template_body = template_body[len(header) :]
-        result["message"] = (
-            "管理者に確認してください。\n"
-            "確認前に以下を整理してください:\n"
-            f"{template_body}"
-        )
+    if not is_attendance_inquiry(inquiry_text, intent_name):
+        dev_log_llm(called=False, reason="勤怠外")
+        result["type"] = OTHER
+        result["message"] = OUT_OF_SCOPE_MESSAGE
+        return result
 
+    # --- 主経路: LLM 意図理解 → ルール検索 or 管理者案内 ---
+    if intent_name in ("rule_check", None):
+        answer, matched_rules = generate_answer(
+            inquiry_text, rule_data, intent=intent_name, category_hint=category_hint
+        )
+        result["type"] = RULE_CHECK
+        if matched_rules:
+            section = _section_name_from_rule_block(matched_rules[0])
+            if section:
+                result["category"] = section
+        result["message"] = f"回答: {answer}"
+        return result
+
+    if intent_name == "leave" and is_leave_policy_question(inquiry_text):
+        answer, matched_rules = generate_answer(
+            inquiry_text,
+            rule_data,
+            intent="rule_check",
+            category_hint=CATEGORY_PAID_LEAVE,
+        )
+        result["type"] = RULE_CHECK
+        if matched_rules:
+            section = _section_name_from_rule_block(matched_rules[0])
+            if section:
+                result["category"] = section
+        result["message"] = f"回答: {answer}"
+        return result
+
+    if intent_name in ("attendance_correction", "leave", "needs_individual_handling"):
+        handoff_category = resolve_handoff_category(
+            inquiry_text, intent_name, legacy_category
+        )
+        dev_log_llm(called=False, reason=f"意図={intent_name}")
+        result["type"] = result_type_for_intent(intent_name)
+        result["category"] = handoff_category
+        result["message"] = build_handoff_message(handoff_category)
+        return result
+
+    # insufficient_info 等: ルール検索を試み、なければ該当なし
+    answer, matched_rules = generate_answer(
+        inquiry_text,
+        rule_data,
+        intent=intent_name,
+        category_hint=category_hint,
+    )
+    if matched_rules:
+        result["type"] = RULE_CHECK
+        section = _section_name_from_rule_block(matched_rules[0])
+        if section:
+            result["category"] = section
+        result["message"] = f"回答: {answer}"
+        return result
+
+    result["type"] = RULE_CHECK
+    result["message"] = f"回答: {answer}"
     return result
 
 
