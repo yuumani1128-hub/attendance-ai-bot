@@ -6,7 +6,7 @@ import html
 
 import streamlit as st
 
-from main import load_rules, process_inquiry
+from main import load_rules, process_inquiry, trim_stored_messages
 
 # ---------------------------------------------------------------------------
 # 定数（UI表示用。判定ロジック自体は main.py に任せる）
@@ -461,14 +461,23 @@ def process_and_append_message(text: str) -> None:
     """
     1件の問い合わせを main.py に渡し、ユーザー/ボットメッセージを履歴に追加する。
     種別・カテゴリは画面には出さず、ボット回答の整形にだけ内部利用する。
+
+    処理時は現在の発言より前の履歴を渡し、会話の文脈を踏まえて判定する。
     """
     cleaned = text.strip()
     if not cleaned:
         return
 
+    # 現在の発言を追加する前の履歴（role / content 形式）を処理に渡す
+    history = list(st.session_state.messages)
+
     st.session_state.messages.append({"role": "user", "content": cleaned})
 
-    result = process_inquiry(cleaned, st.session_state.rules_data)
+    result = process_inquiry(
+        cleaned,
+        st.session_state.rules_data,
+        conversation_history=history,
+    )
     bot_reply = build_bot_reply(result)
 
     st.session_state.messages.append(
@@ -479,6 +488,8 @@ def process_and_append_message(text: str) -> None:
             "category": result["category"],
         }
     )
+
+    st.session_state.messages = trim_stored_messages(st.session_state.messages)
 
 
 def render_sidebar() -> None:
