@@ -44,6 +44,7 @@ RULE_KEYWORDS = (
     "制度",
     "休暇",
     "有給",
+    "有休",
     "遅刻",
     "電車遅延",
     "遅延",
@@ -114,6 +115,7 @@ RULE_SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
     CATEGORY_DESCRIPTION_MISTAKE: ("記載ミス", "記載", "入力ミス", "誤記", "誤入力"),
     CATEGORY_PAID_LEAVE: (
         "有給",
+        "有休",
         "年休",
         "年次有給",
         "休暇",
@@ -141,6 +143,7 @@ INTENT_SECTION_CANDIDATES: dict[str, tuple[str, ...] | None] = {
 # 勤怠ドメイン語（rule_check 時に勤怠関連か判定する）
 ATTENDANCE_DOMAIN_KEYWORDS: tuple[str, ...] = (
     "有給",
+    "有休",
     "年休",
     "休暇",
     "休み",
@@ -322,7 +325,7 @@ def needs_clock_type_clarification(conversation_text: str) -> bool:
 
 def needs_leave_date_clarification(conversation_text: str) -> bool:
     """有給・休暇の取得希望で、取得予定日などが会話上まだ特定できない場合。"""
-    if not any(kw in conversation_text for kw in ("有給", "休暇", "休み", "午前休", "午後休", "半休")):
+    if not any(kw in conversation_text for kw in ("有給", "有休", "休暇", "休み", "午前休", "午後休", "半休")):
         return False
     date_hints = (
         "今日",
@@ -494,7 +497,7 @@ def get_rule_answer(category: str, rules: dict[str, str]) -> str | None:
 
 def is_leave_policy_question(query: str) -> bool:
     """有給・休暇の制度・期限に関するルール確認か（取得申告ではない）。"""
-    if not any(kw in query for kw in ("有給", "年休", "休暇", "休み")):
+    if not any(kw in query for kw in ("有給", "有休", "年休", "休暇", "休み")):
         return False
     return any(
         kw in query
@@ -693,7 +696,7 @@ def resolve_handoff_category(
     if legacy_category != OTHER:
         return legacy_category
     if intent == "leave":
-        if any(kw in inquiry_text for kw in ("有給", "年休", "休暇")):
+        if any(kw in inquiry_text for kw in ("有給", "有休", "年休", "休暇")):
             return CATEGORY_PAID_LEAVE
         return CATEGORY_HALF_DAY_OFF
     if intent == "attendance_correction":
@@ -730,6 +733,7 @@ def generate_answer(
     rules: dict[str, str],
     intent: str | None = None,
     category_hint: str | None = None,
+    conversation_context: str | None = None,
 ) -> tuple[str, list[str]]:
     """
     ルール確認向けの回答文を LLM で生成する（関連ルールのみ API に送信）。
@@ -737,8 +741,9 @@ def generate_answer(
     Returns:
         (回答文, マッチしたルールブロックのリスト)
     """
+    query_for_search = conversation_context or user_input
     matched_rules = search_rules(
-        user_input,
+        query_for_search,
         rules=rules,
         intent=intent,
         category_hint=category_hint,
@@ -747,7 +752,37 @@ def generate_answer(
         dev_log_llm(called=False, reason="ルール未該当")
         return ("該当するルールが見つかりません。管理者に確認してください。", [])
     rule_context = "\n\n".join(matched_rules)
-    return (generate_llm_response(user_input, rule_context), matched_rules)
+    answer = generate_llm_response(
+        user_input,
+        rule_context,
+        conversation_context=conversation_context,
+    )
+    return (answer, matched_rules)
+
+
+def complete_rule_check_result(
+    result: dict[str, str | dict[str, str | bool] | None | bool],
+    inquiry_text: str,
+    intent_context: str,
+    rule_data: dict[str, str],
+    intent_name: str | None,
+    category_hint: str | None,
+) -> dict[str, str | dict[str, str | bool] | None | bool]:
+    """ルール検索 → LLM 回答生成までを行い、result を完成させる。"""
+    answer, matched_rules = generate_answer(
+        inquiry_text,
+        rule_data,
+        intent=intent_name,
+        category_hint=category_hint,
+        conversation_context=intent_context,
+    )
+    result["type"] = RULE_CHECK
+    if matched_rules:
+        section = _section_name_from_rule_block(matched_rules[0])
+        if section:
+            result["category"] = section
+    result["message"] = f"回答: {answer}"
+    return result
 
 
 def process_inquiry(
@@ -758,11 +793,13 @@ def process_inquiry(
     """
     1件の問い合わせを処理して、画面表示に必要な結果をまとめて返す。
 
-    Streamlit UI と CLI の両方から同じ処理を呼べるようにしておくと、
-    判定ロジックの修正が1か所で済みます。
-
-    conversation_history が渡された場合、直近の履歴と合わせた文脈で判定する。
-    履歴は MAX_PROCESSING_HISTORY 件までに制限する。
+    統合フロー:
+    1. 会話履歴を確認
+    2. LLM による意図理解
+    3. 情報不足なら追加質問
+    4. 勤怠外なら案内して終了
+    5. 必要なルールを検索
+    6. 検索したルールと会話文脈を LLM へ渡して自然な口語で回答
     """
     rule_data = load_rules() if rules is None else rules
 
@@ -804,33 +841,21 @@ def process_inquiry(
         result["message"] = OUT_OF_SCOPE_MESSAGE
         return result
 
-    # --- 主経路: LLM 意図理解 → ルール検索 or 管理者案内 ---
+    # --- 主経路: 意図理解 → ルール検索 → LLM 回答 / 管理者案内 ---
     if intent_name in ("rule_check", None):
-        answer, matched_rules = generate_answer(
-            inquiry_text, rule_data, intent=intent_name, category_hint=category_hint
+        return complete_rule_check_result(
+            result, inquiry_text, intent_context, rule_data, intent_name, category_hint
         )
-        result["type"] = RULE_CHECK
-        if matched_rules:
-            section = _section_name_from_rule_block(matched_rules[0])
-            if section:
-                result["category"] = section
-        result["message"] = f"回答: {answer}"
-        return result
 
     if intent_name == "leave" and is_leave_policy_question(inquiry_text):
-        answer, matched_rules = generate_answer(
+        return complete_rule_check_result(
+            result,
             inquiry_text,
+            intent_context,
             rule_data,
-            intent="rule_check",
-            category_hint=CATEGORY_PAID_LEAVE,
+            "rule_check",
+            CATEGORY_PAID_LEAVE,
         )
-        result["type"] = RULE_CHECK
-        if matched_rules:
-            section = _section_name_from_rule_block(matched_rules[0])
-            if section:
-                result["category"] = section
-        result["message"] = f"回答: {answer}"
-        return result
 
     if intent_name in ("attendance_correction", "leave", "needs_individual_handling"):
         handoff_category = resolve_handoff_category(
@@ -843,23 +868,9 @@ def process_inquiry(
         return result
 
     # insufficient_info 等: ルール検索を試み、なければ該当なし
-    answer, matched_rules = generate_answer(
-        inquiry_text,
-        rule_data,
-        intent=intent_name,
-        category_hint=category_hint,
+    return complete_rule_check_result(
+        result, inquiry_text, intent_context, rule_data, intent_name, category_hint
     )
-    if matched_rules:
-        result["type"] = RULE_CHECK
-        section = _section_name_from_rule_block(matched_rules[0])
-        if section:
-            result["category"] = section
-        result["message"] = f"回答: {answer}"
-        return result
-
-    result["type"] = RULE_CHECK
-    result["message"] = f"回答: {answer}"
-    return result
 
 
 def main() -> None:

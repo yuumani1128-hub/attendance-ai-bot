@@ -22,14 +22,19 @@ MAX_OUTPUT_TOKENS = 300
 
 LLM_UNAVAILABLE_MESSAGE = "現在AI回答を利用できません。管理者へ確認してください。"
 
-SYSTEM_PROMPT = (
-    "社内勤怠問い合わせアシスタント。"
-    "【ルール】に記載された内容のみを根拠に、簡潔な日本語で回答する。"
-    "質問が短くても、提供されたルールに該当する記載があれば、その内容を説明する。"
-    "ルールに記載が無いことだけ推測せず、"
-    "「ルール上確認できないため、管理者へ確認してください」と案内する。"
-    "存在しない制度や手続きは作らない。"
+ANSWER_SYSTEM_PROMPT = (
+    "あなたは社内勤怠ルールについて回答するアシスタントです。"
+    "【ルール】に記載された情報のみを根拠に、簡潔で自然な口語の日本語で回答してください。"
+    "根拠のない内容を推測して断定しないでください。"
+    "ルールに記載が無い場合は「ルール上確認できないため、管理者へ確認してください」と案内してください。"
+    "個別判断や管理者権限が必要な内容は、管理者確認を案内してください。"
+    "【会話履歴】がある場合は文脈を踏まえてください。"
+    "情報が不足している場合は、追加で1回だけ必要な質問をしてください。"
+    "存在しない制度や手続きは作らないでください。"
 )
+
+# 後方互換のエイリアス
+SYSTEM_PROMPT = ANSWER_SYSTEM_PROMPT
 
 IntentType = Literal[
     "rule_check",
@@ -168,17 +173,25 @@ def analyze_intent(conversation_text: str) -> IntentAnalysis | None:
         return None
 
 
-def generate_llm_response(question: str, rule_context: str) -> str:
+def generate_llm_response(
+    question: str,
+    rule_context: str,
+    conversation_context: str | None = None,
+) -> str:
     """
-    ユーザー質問と関連ルールだけを OpenAI API に送り、回答文を返す。
-    過去のチャット履歴は送らない（1質問1回の API 呼び出し）。
+    関連ルールと会話文脈を OpenAI API に送り、回答文を返す。
+    conversation_context は直近履歴を含む（上限は呼び出し元で制御）。
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         dev_log_llm(called=False, reason="APIキー未設定")
         return LLM_UNAVAILABLE_MESSAGE
 
-    user_content = f"【ルール】\n{rule_context}\n\n【質問】\n{question}"
+    parts = [f"【ルール】\n{rule_context}"]
+    if conversation_context and conversation_context.strip():
+        parts.append(f"【会話履歴】\n{conversation_context.strip()}")
+    parts.append(f"【質問】\n{question.strip()}")
+    user_content = "\n\n".join(parts)
 
     try:
         dev_log_llm(called=True)
@@ -186,7 +199,7 @@ def generate_llm_response(question: str, rule_context: str) -> str:
         response = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
             max_tokens=MAX_OUTPUT_TOKENS,
